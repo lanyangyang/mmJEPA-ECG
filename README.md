@@ -15,3 +15,22 @@ The core code files and directory structure of this repository are as follows:
 
 ## 3. Dataset Statement
 To protect subject privacy and strictly comply with clinical ethics guidelines, the associated multi-posture synchronized mmWave radar and ECG dataset is currently undergoing rigorous privacy desensitization and anonymization screening. **Codes and subset data will be released as soon as the anonymization screening process is cleared**. Please stay tuned for future updates to this repository.
+
+## Citation
+
+If you find this repository useful for your research, please consider citing:
+> Liu, Z., He, S., Liang, F., Huang, C., Zhong, S., & Wu, K. (2026). mmJEPA-ECG: Cross-Posture Robust Contactless Electrocardiogram Monitoring via Millimeter Wave Radar Sensing. *Proceedings of the AAAI Conference on Artificial Intelligence*, 40(45), 38962-38970. https://doi.org/10.1609/aaai.v40i45.41242
+
+**BibTeX:**
+
+```bibtex
+@inproceedings{liu2026mmjepa,
+  title={mmJEPA-ECG: Cross-Posture Robust Contactless Electrocardiogram Monitoring via Millimeter Wave Radar Sensing},
+  author={Liu, Z. and He, S. and Liang, F. and Huang, C. and Zhong, S. and Wu, K.},
+  booktitle={Proceedings of the AAAI Conference on Artificial Intelligence},
+  volume={40},
+  number={45},
+  pages={38962--38970},
+  year={2026},
+  doi={10.1609/aaai.v40i45.41242}
+}
