@@ -4,7 +4,7 @@ mmJEPA Pre-Training Script
 Key Features:
 - Student-Teacher architecture with EMA updates
 - Multi-mask prediction (time, channel, block masks)
-# - Heart rate prediction
+- Heart rate prediction
 - Cosine learning rate scheduling with warmup
 - Weight decay scheduling
 - Wandb logging support
@@ -16,7 +16,7 @@ Loss Components:
     - Time mask loss
     - Channel mask loss
     - Block mask loss
-#    - Heart rate loss
+    - Heart rate loss
 """
 
 import argparse
@@ -32,7 +32,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 from torch.nn.utils import clip_grad_norm_
-from block.data_load import npyLoad
+from block.data_load import npyLoadWithHR
 from block.backbone_multi_target import context_encoder, attn_MultiMaskPredictor
 from block.utils import build_wd_scheduler, build_ema_scheduler, show_masks
 from block.block_mask import mm_mask
@@ -129,6 +129,9 @@ def parse_args():
 
     parser.add_argument('-profile_epoch', type=int, default=1)
     parser.add_argument('-track_power', action='store_true')
+    parser.add_argument('-hr_delta', type=float, default=5.0)
+    parser.add_argument('-hr_weight_a', type=float, default=1.0)
+    parser.add_argument('-hr_weight_b', type=float, default=2.0)
 
     args = parser.parse_args()
     return args
@@ -151,6 +154,9 @@ pre_layers = args.pre_layers
 n_heads = args.n_heads
 d_ff = args.d_ff
 eta_min_ratio = args.eta_min_ratio
+hr_delta = args.hr_delta
+hr_weight_a = args.hr_weight_a
+hr_weight_b = args.hr_weight_b
 
 torch.manual_seed(42)
 device = torch.device(args.device if torch.cuda.is_available() else "cpu")
@@ -167,8 +173,8 @@ def write_to_stats(message):
     stats_file.write(message + '\n')
     stats_file.flush()
 
-train_ds = npyLoad("./data/train_UD_RMS_all.npy", device='cpu')
-test_ds  = npyLoad('./data/test_UD_RMS_all.npy',  device='cpu')
+train_ds = npyLoadWithHR("./data/train_UD_RMS_all.npy", device='cpu')
+test_ds  = npyLoadWithHR('./data/test_UD_RMS_all.npy',  device='cpu')
 
 dl_kwargs = dict(batch_size=batch_size, num_workers=8,
                  pin_memory=True, persistent_workers=True)
@@ -200,6 +206,16 @@ optim = torch.optim.AdamW(
 )
 
 criterion = nn.L1Loss()
+
+def weighted_hr_loss(hr_pred, hr_target, delta=5.0, weight_a=1.0, weight_b=2.0):
+    hr_target = hr_target.view_as(hr_pred)
+    abs_err = torch.abs(hr_pred - hr_target)
+    weights = torch.where(
+        abs_err < delta,
+        torch.full_like(abs_err, weight_a),
+        torch.full_like(abs_err, weight_b),
+    )
+    return (weights * (hr_pred - hr_target).pow(2)).mean()
 
 total_steps = len(train_loader) * num_epochs
 warm_steps = int(args.warm * total_steps)
@@ -271,6 +287,8 @@ for epoch in range(1, num_epochs + 1):
         train_time_loss_sum = 0.0
         train_cha_loss_sum = 0.0
         train_blk_loss_sum = 0.0
+        train_hr_loss_sum = 0.0
+        train_hr_mae_sum = 0.0
 
         n_train_batches = 0
 
@@ -278,7 +296,7 @@ for epoch in range(1, num_epochs + 1):
         batch_powers = []
         profile_this_epoch = (epoch == args.profile_epoch)
 
-        for batch_idx, (rcg, ecg, pos, y) in enumerate(train_loader):
+        for batch_idx, (rcg, ecg, pos, y, hr) in enumerate(train_loader):
 
             if profile_this_epoch:
                 if torch.cuda.is_available():
@@ -289,6 +307,7 @@ for epoch in range(1, num_epochs + 1):
 
             rcg = rcg.to(device, non_blocking=True)
             pos = pos.to(device, non_blocking=True)
+            hr = hr.to(device, non_blocking=True).float().view(-1, 1)
 
             B, L, V, _ = rcg.shape
             D = d_model
@@ -320,7 +339,7 @@ for epoch in range(1, num_epochs + 1):
             train_student_norm_std_sum += batch_stu_std
 
             mask_list = (mt, mc, mb)
-            hat1, hat2, hat3 = predictor(x_pad, mask_list)[:3]
+            hat1, hat2, hat3, hr_pred = predictor(x_pad, mask_list)
 
             with torch.no_grad():
                 x_full_ctx = teacher(rcg, position=pos, obs_m=None)
@@ -337,8 +356,12 @@ for epoch in range(1, num_epochs + 1):
             time_loss = criterion(hat1, yT1)
             cha_loss = criterion(hat2, yT2)
             blk_loss = criterion(hat3, yT3)
+            hr_loss = weighted_hr_loss(
+                hr_pred, hr, delta=hr_delta, weight_a=hr_weight_a, weight_b=hr_weight_b
+            )
+            hr_mae = torch.abs(hr_pred - hr).mean()
 
-            loss = time_loss + cha_loss + blk_loss
+            loss = time_loss + cha_loss + blk_loss + hr_loss
 
             wd_cur = next(wd_iter)
             for pg in optim.param_groups:
@@ -362,6 +385,8 @@ for epoch in range(1, num_epochs + 1):
             train_time_loss_sum += time_loss.item()
             train_cha_loss_sum += cha_loss.item()
             train_blk_loss_sum += blk_loss.item()
+            train_hr_loss_sum += hr_loss.item()
+            train_hr_mae_sum += hr_mae.item()
 
             n_train_batches += 1
 
@@ -383,6 +408,8 @@ for epoch in range(1, num_epochs + 1):
         avg_time_loss = train_time_loss_sum / n_train_batches
         avg_cha_loss = train_cha_loss_sum / n_train_batches
         avg_blk_loss = train_blk_loss_sum / n_train_batches
+        avg_hr_loss = train_hr_loss_sum / n_train_batches
+        avg_hr_mae = train_hr_mae_sum / n_train_batches
 
         student.eval()
         predictor.eval()
@@ -391,13 +418,16 @@ for epoch in range(1, num_epochs + 1):
         test_time_loss_sum = 0.0
         test_cha_loss_sum = 0.0
         test_blk_loss_sum = 0.0
+        test_hr_loss_sum = 0.0
+        test_hr_mae_sum = 0.0
 
         n_test_batches = 0
 
         with torch.no_grad():
-            for batch_idx, (rcg, ecg, pos, y) in enumerate(test_loader):
+            for batch_idx, (rcg, ecg, pos, y, hr) in enumerate(test_loader):
                 rcg = rcg.to(device, non_blocking=True)
                 pos = pos.to(device, non_blocking=True)
+                hr = hr.to(device, non_blocking=True).float().view(-1, 1)
 
                 B, L, V, _ = rcg.shape
                 D = d_model
@@ -412,7 +442,7 @@ for epoch in range(1, num_epochs + 1):
 
                 _, z_pad = student(rcg, position=pos, obs_m=x_obs_m)
 
-                hat1, hat2, hat3 = predictor(z_pad, (mt, mc, mb))[:3]
+                hat1, hat2, hat3, hr_pred = predictor(z_pad, (mt, mc, mb))
 
                 x_full_ctx = teacher(rcg, position=pos, obs_m=None)
 
@@ -423,19 +453,27 @@ for epoch in range(1, num_epochs + 1):
                 time_loss = criterion(hat1, yT1)
                 cha_loss = criterion(hat2, yT2)
                 blk_loss = criterion(hat3, yT3)
+                hr_loss = weighted_hr_loss(
+                    hr_pred, hr, delta=hr_delta, weight_a=hr_weight_a, weight_b=hr_weight_b
+                )
+                hr_mae = torch.abs(hr_pred - hr).mean()
 
-                loss = time_loss + cha_loss + blk_loss
+                loss = time_loss + cha_loss + blk_loss + hr_loss
 
                 test_loss_sum += loss.item()
                 test_time_loss_sum += time_loss.item()
                 test_cha_loss_sum += cha_loss.item()
                 test_blk_loss_sum += blk_loss.item()
+                test_hr_loss_sum += hr_loss.item()
+                test_hr_mae_sum += hr_mae.item()
 
                 n_test_batches += 1
 
         test_avg_time_loss = test_time_loss_sum / n_test_batches
         test_avg_cha_loss = test_cha_loss_sum / n_test_batches
         test_avg_blk_loss = test_blk_loss_sum / n_test_batches
+        test_avg_hr_loss = test_hr_loss_sum / n_test_batches
+        test_avg_hr_mae = test_hr_mae_sum / n_test_batches
 
         avg_stu_mean = train_student_norm_mean_sum / train_norm_cnt
         avg_stu_std = train_student_norm_std_sum / train_norm_cnt
@@ -446,13 +484,17 @@ for epoch in range(1, num_epochs + 1):
               f"tr_time_loss={avg_time_loss:.5f} | "
               f"tr_cha_loss={avg_cha_loss:.5f} | "
               f"tr_blk_loss={avg_blk_loss:.5f} | "
-              f"tr_total_loss={avg_time_loss + avg_cha_loss + avg_blk_loss:.5f}")
+              f"tr_hr_loss={avg_hr_loss:.5f} | "
+              f"tr_hr_mae={avg_hr_mae:.5f} | "
+              f"tr_total_loss={avg_time_loss + avg_cha_loss + avg_blk_loss + avg_hr_loss:.5f}")
 
         print(f"Epoch {epoch:02d} | "
               f"te_time_loss={test_avg_time_loss:.5f} | "
               f"te_cha_loss={test_avg_cha_loss:.5f} | "
               f"te_blk_loss={test_avg_blk_loss:.5f} | "
-              f"te_total_loss={test_avg_time_loss + test_avg_cha_loss + test_avg_blk_loss:.5f}")
+              f"te_hr_loss={test_avg_hr_loss:.5f} | "
+              f"te_hr_mae={test_avg_hr_mae:.5f} | "
+              f"te_total_loss={test_avg_time_loss + test_avg_cha_loss + test_avg_blk_loss + test_avg_hr_loss:.5f}")
 
         if profile_this_epoch and len(batch_latencies) > 0:
             write_to_stats(f"\n{'='*60}")
@@ -503,8 +545,10 @@ for epoch in range(1, num_epochs + 1):
                 "train/avg_time_loss": avg_time_loss,
                 "train/avg_cha_loss": avg_cha_loss,
                 "train/avg_blk_loss": avg_blk_loss,
+                "train/avg_hr_loss": avg_hr_loss,
+                "train/hr_mae": avg_hr_mae,
 
-                "train/avg_total": avg_time_loss + avg_cha_loss + avg_blk_loss,
+                "train/avg_total": avg_time_loss + avg_cha_loss + avg_blk_loss + avg_hr_loss,
                 "train/student_norm_mean": avg_stu_mean,
                 "train/student_norm_std": avg_stu_std,
                 "train/teacher_norm_mean": avg_tea_mean,
@@ -513,8 +557,10 @@ for epoch in range(1, num_epochs + 1):
                 "val/avg_time_loss": test_avg_time_loss,
                 "val/avg_cha_loss": test_avg_cha_loss,
                 "val/avg_blk_loss": test_avg_blk_loss,
+                "val/avg_hr_loss": test_avg_hr_loss,
+                "val/hr_mae": test_avg_hr_mae,
 
-                "val/avg_total": test_avg_time_loss + test_avg_cha_loss + test_avg_blk_loss,
+                "val/avg_total": test_avg_time_loss + test_avg_cha_loss + test_avg_blk_loss + test_avg_hr_loss,
 
                 "lr": scheduler.get_last_lr()[0],
             }
